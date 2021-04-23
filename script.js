@@ -20,93 +20,143 @@ export async function script(octokit, repository, { author }) {
   }
 
   for (const pr of pullRequests) {
-    const query = `query($htmlUrl: URI!) {
+    const query = `query prStatus($htmlUrl: URI!) {
       resource(url: $htmlUrl) {
         ... on PullRequest {
-          state
-          author {
-            login
-          }
-          files(first:2) {
+          # merge status
+          mergeable
+          # review status
+          reviewDecision
+          viewerCanUpdate
+          viewerDidAuthor
+          latestOpinionatedReviews(first:10,writersOnly:true) {
             nodes {
-              path
+              viewerDidAuthor
             }
           }
+          # CI status
           commits(last: 1) {
             nodes {
               commit {
                 oid
-                checkSuites(first: 100) {
-                  nodes {
-                    checkRuns(first: 100) {
-                      nodes {
-                        name
-                        conclusion
-                        permalink
-                      }
-                    }
-                  }
-                }
-                status {
+                statusCheckRollup {
                   state
-                  contexts {
-                    state
-                    targetUrl
-                    description
-                    context
-                  }
                 }
               }
             }
           }
         }
       }
-    }`;
+    }
+    `;
 
     const result = await octokit.graphql(query, {
       htmlUrl: pr.html_url,
     });
 
-    const [{ commit: lastCommit }] = result.resource.commits.nodes;
-    const checkRuns = [].concat(
-      ...lastCommit.checkSuites.nodes.map((node) => node.checkRuns.nodes)
+    const {
+      reviewDecision,
+      mergeable,
+      viewerCanUpdate,
+      viewerDidAuthor,
+    } = result.resource;
+    const combinedStatus =
+      result.resource.commits.nodes[0].commit.statusCheckRollup.state;
+    const viewerDidApprove = !!result.resource.latestOpinionatedReviews.nodes.find(
+      (node) => node.viewerDidAuthor
     );
-    const statuses = lastCommit.status ? lastCommit.status.contexts : [];
+    const latestCommitId = result.resource.commits.nodes[0].commit.oid;
 
-    const unsuccessfulCheckRuns = checkRuns
-      .filter(
-        (checkRun) =>
-          checkRun.conclusion !== "SUCCESS" && checkRun.conclusion !== "NEUTRAL"
-      )
-      .filter((checkRun) => {
-        return checkRun.conclusion !== null;
-      });
-    const unsuccessStatuses = statuses.filter(
-      (status) => status.state !== "SUCCESS"
-    );
+    const logData = {
+      pr: {
+        number: pr.number,
+        reviewDecision,
+        mergeable,
+        combinedStatus,
+        viewerCanUpdate,
+      },
+    };
 
-    if (unsuccessfulCheckRuns.length || unsuccessStatuses.length) {
+    console.log(`viewerCanUpdate`);
+    console.log(viewerCanUpdate);
+
+    if (!viewerCanUpdate) {
       octokit.log.info(
-        `${
-          unsuccessfulCheckRuns.length + unsuccessStatuses.length
-        } checks/statuses out of ${
-          checkRuns.length + statuses.length
-        } are not successful:`
+        logData,
+        `%s: you cannot update this PR. Skipping`,
+        pr.html_url
       );
-
-      for (const checkRun of unsuccessfulCheckRuns) {
-        octokit.log.info(`- Check run by "${checkRun.name}"
-              Conclusion: ${checkRun.conclusion}
-              ${checkRun.permalink}`);
-      }
-
-      for (const status of unsuccessStatuses) {
-        octokit.log.info(`- Status run by "${status.context}"
-              state: ${status.state}
-              ${status.targetUrl}`);
-      }
-
       continue;
+    }
+
+    if (combinedStatus !== "SUCCESS") {
+      octokit.log.info(
+        logData,
+        `%s: status is "%s". Skipping`,
+        pr.html_url,
+        combinedStatus
+      );
+      continue;
+    }
+
+    if (mergeable !== "MERGEABLE") {
+      octokit.log.info(
+        logData,
+        `%s: mergable status is "%s". Skipping`,
+        pr.html_url,
+        mergeable
+      );
+      continue;
+    }
+
+    let approved;
+    if (reviewDecision !== "APPROVED") {
+      if (!viewerDidAuthor && !viewerDidApprove) {
+        // attempt to add approval
+        await octokit.request(
+          "POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews",
+          {
+            owner: repository.owner.login,
+            repo: repository.name,
+            pull_number: pr.number,
+            event: "APPROVE",
+            commit_id: latestCommitId,
+          }
+        );
+        approved = true;
+
+        // check if PR is now approved
+        const {
+          resource: { reviewDecision: newReviewDecision },
+        } = await octokit.graphql(
+          `query prStatus($htmlUrl: URI!) {
+            resource(url: $htmlUrl) {
+              ... on PullRequest {
+                reviewDecision
+              }
+            }
+          }`,
+          {
+            htmlUrl: pr.html_url,
+          }
+        );
+
+        if (newReviewDecision !== "APPROVED") {
+          octokit.log.info(
+            logData,
+            "%s: awaiting approval. Skipping",
+            pr.html_url
+          );
+          continue;
+        }
+      } else {
+        octokit.log.info(
+          logData,
+          "%s: awaiting approval. Skipping",
+          pr.html_url
+        );
+        continue;
+      }
     }
 
     await octokit.request(
